@@ -32,7 +32,20 @@ HEADERS = {
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Referer": "https://www.bilibili.com",
     "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Origin": "https://www.bilibili.com",
 }
+
+# 全局Cookie（运行时设置）
+BILIBILI_COOKIE = ""
+
+
+def set_cookie(cookie):
+    """设置B站Cookie到请求头"""
+    global BILIBILI_COOKIE
+    BILIBILI_COOKIE = cookie
+    if cookie:
+        HEADERS["Cookie"] = cookie
 
 # 情感词典（简单版）
 POSITIVE_WORDS = {
@@ -126,15 +139,76 @@ def extract_bvid(input_str):
 # B站API
 # ============================================================
 
+# WBI签名相关
+MIXIN_KEY_ENC_TAB = [
+    46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
+    27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
+    37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4,
+    22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52
+]
+
+_wbi_keys_cache = None
+
+
+def get_wbi_keys():
+    """获取wbi签名的img_key和sub_key（带缓存）"""
+    global _wbi_keys_cache
+    if _wbi_keys_cache:
+        return _wbi_keys_cache
+    url = "https://api.bilibili.com/x/web-interface/nav"
+    resp = safe_get(url)
+    if not resp:
+        return None, None
+    data = resp.json()
+    if data.get("code") != 0:
+        return None, None
+    wbi_img = data.get("data", {}).get("wbi_img", {})
+    img_url = wbi_img.get("img_url", "")
+    sub_url = wbi_img.get("sub_url", "")
+    img_key = img_url.split("/")[-1].split(".")[0]
+    sub_key = sub_url.split("/")[-1].split(".")[0]
+    _wbi_keys_cache = (img_key, sub_key)
+    return img_key, sub_key
+
+
+def get_mixin_key(img_key, sub_key):
+    """生成mixin_key"""
+    raw = img_key + sub_key
+    return "".join(raw[i] for i in MIXIN_KEY_ENC_TAB)[:32]
+
+
+def sign_params(params):
+    """对请求参数进行wbi签名"""
+    import hashlib
+    from urllib.parse import quote
+    img_key, sub_key = get_wbi_keys()
+    if not img_key or not sub_key:
+        return params
+    mixin_key = get_mixin_key(img_key, sub_key)
+    params = dict(params)
+    params["wts"] = int(time.time())
+    # 按key排序
+    sorted_params = dict(sorted(params.items()))
+    # 对value进行URL编码并拼接
+    query = "&".join(f"{k}={quote(str(v), safe='!*()')}" for k, v in sorted_params.items())
+    # 计算md5
+    w_rid = hashlib.md5((query + mixin_key).encode()).hexdigest()
+    sorted_params["w_rid"] = w_rid
+    return sorted_params
+
+
 def get_video_info(bvid):
     """获取视频基本信息"""
     url = "https://api.bilibili.com/x/web-interface/view"
-    resp = safe_get(url, params={"bvid": bvid})
+    params = sign_params({"bvid": bvid})
+    resp = safe_get(url, params=params)
     if not resp:
         return None
     data = resp.json()
     if data.get("code") != 0:
-        print(f"❌ 获取视频信息失败: {data.get('message', '未知错误')}")
+        print(f"❌ 获取视频信息失败: {data.get('message', '未知错误')} (code={data.get('code')})")
+        print(f"   请求URL: {resp.url}")
+        print(f"   返回数据: {str(data)[:500]}")
         return None
     d = data["data"]
     return {
@@ -166,13 +240,13 @@ def get_comments(aid, max_pages=50):
     page = 0
     
     while page < max_pages:
-        params = {
+        params = sign_params({
             "type": 1,
             "oid": aid,
             "mode": 3,  # 3=按热度排序
             "next": next_cursor,
             "ps": 20,
-        }
+        })
         resp = safe_get(url, params=params)
         if not resp:
             break
@@ -252,6 +326,225 @@ def get_danmaku(cid):
                 continue
     
     return danmakus
+
+
+def get_video_tags(bvid):
+    """获取视频标签"""
+    url = "https://api.bilibili.com/x/tag/archive/tags"
+    resp = safe_get(url, params={"bvid": bvid})
+    if not resp:
+        return []
+    data = resp.json()
+    if data.get("code") != 0:
+        return []
+    tags = []
+    for t in data.get("data", []):
+        tags.append({
+            "tag_id": t.get("tag_id", ""),
+            "tag_name": t.get("tag_name", ""),
+            "count": t.get("count", 0),
+            "type": t.get("type", 0),
+        })
+    return tags
+
+
+def get_video_subtitle(bvid, cid):
+    """获取视频AI字幕"""
+    # 先获取字幕列表
+    url = "https://api.bilibili.com/x/player/v2"
+    resp = safe_get(url, params={"bvid": bvid, "cid": cid})
+    if not resp:
+        return None, "无法获取字幕信息"
+    
+    data = resp.json()
+    if data.get("code") != 0:
+        return None, data.get("message", "获取字幕失败")
+    
+    subtitle_info = data.get("data", {}).get("subtitle", {})
+    subtitles = subtitle_info.get("subtitles", [])
+    
+    if not subtitles:
+        return None, "该视频暂无AI字幕"
+    
+    # 获取第一个字幕（通常是中文）
+    subtitle_url = subtitles[0].get("subtitle_url", "")
+    if not subtitle_url:
+        return None, "字幕链接为空"
+    
+    if subtitle_url.startswith("//"):
+        subtitle_url = "https:" + subtitle_url
+    
+    # 下载字幕内容
+    resp = safe_get(subtitle_url)
+    if not resp:
+        return None, "下载字幕失败"
+    
+    try:
+        subtitle_data = resp.json()
+        body = subtitle_data.get("body", [])
+        subtitles_list = []
+        full_text = ""
+        for item in body:
+            subtitles_list.append({
+                "from": item.get("from", 0),
+                "to": item.get("to", 0),
+                "content": item.get("content", ""),
+            })
+            full_text += item.get("content", "") + " "
+        
+        return {
+            "subtitles": subtitles_list,
+            "full_text": full_text.strip(),
+            "count": len(subtitles_list),
+            "lan": subtitles[0].get("lan", ""),
+        }, None
+    except Exception as e:
+        return None, f"解析字幕失败: {str(e)}"
+
+
+def summarize_video_content(video_info, subtitle_data, tags, comments, danmakus):
+    """
+    智能总结视频内容
+    综合：视频简介、字幕、标签、评论高频词、弹幕高频词
+    """
+    summary = {
+        "has_subtitle": subtitle_data is not None,
+        "subtitle_error": None,
+        "tags": [t["tag_name"] for t in tags],
+        "key_points": [],
+        "high_freq_words": [],
+        "content_topics": [],
+        "audience_feedback": "",
+        "estimated_reading_time": 0,
+    }
+    
+    if subtitle_data is None:
+        # 没有字幕时，用简介+评论+弹幕来总结
+        summary["subtitle_error"] = "该视频暂无AI字幕，以下基于视频简介、评论和弹幕进行总结"
+    
+    # 1. 提取所有文本用于分析
+    all_texts = []
+    if video_info.get("desc"):
+        all_texts.append(video_info["desc"])
+    if subtitle_data:
+        all_texts.append(subtitle_data["full_text"])
+    for c in comments[:50]:  # 取前50条热门评论
+        all_texts.append(c["content"])
+    for d in danmakus[:200]:  # 取前200条弹幕
+        all_texts.append(d["content"])
+    
+    # 2. 高频词分析
+    try:
+        import jieba
+        all_words = []
+        for text in all_texts:
+            if not text:
+                continue
+            text = re.sub(r"[^\u4e00-\u9fa5a-zA-Z0-9]", " ", text)
+            words = jieba.lcut(text)
+            for w in words:
+                w = w.strip()
+                if len(w) > 1 and w not in STOP_WORDS and not w.isdigit():
+                    all_words.append(w)
+        counter = Counter(all_words)
+        summary["high_freq_words"] = counter.most_common(20)
+    except ImportError:
+        pass
+    
+    # 3. 提取关键句子（基于关键词密度和位置）
+    if subtitle_data and subtitle_data["subtitles"]:
+        subtitles = subtitle_data["subtitles"]
+        # 计算每个句子的关键词密度得分
+        key_words_set = set(w for w, _ in summary["high_freq_words"][:10])
+        scored_sentences = []
+        for i, sub in enumerate(subtitles):
+            content = sub["content"]
+            # 关键词命中数
+            keyword_hits = sum(1 for w in key_words_set if w in content)
+            # 位置权重（开头和结尾的句子更重要）
+            position_score = 0
+            if i < len(subtitles) * 0.1:  # 开头10%
+                position_score = 2
+            elif i > len(subtitles) * 0.9:  # 结尾10%
+                position_score = 1.5
+            # 长度权重（适中长度的句子信息量更大）
+            length = len(content)
+            length_score = 1.0
+            if 10 < length < 50:
+                length_score = 1.5
+            elif length > 80:
+                length_score = 0.8
+            
+            total_score = (keyword_hits * 3 + position_score) * length_score
+            scored_sentences.append((total_score, sub, i))
+        
+        # 取得分最高的8个句子，按时间顺序排列
+        top_sentences = sorted(scored_sentences, key=lambda x: x[0], reverse=True)[:8]
+        top_sentences = sorted(top_sentences, key=lambda x: x[2])
+        
+        for score, sub, idx in top_sentences:
+            time_sec = int(sub["from"])
+            time_str = f"{time_sec//60}:{time_sec%60:02d}"
+            summary["key_points"].append({
+                "time": time_str,
+                "time_sec": time_sec,
+                "content": sub["content"],
+                "score": round(score, 1),
+            })
+    
+    # 4. 内容主题分类（基于高频词）
+    topic_keywords = {
+        "教程/教学": ["教程", "教学", "入门", "零基础", "步骤", "方法", "技巧", "攻略", "指南", "怎么", "如何"],
+        "游戏/娱乐": ["游戏", "玩", "攻略", "角色", "技能", "副本", "boss", "通关", "上分", "段位"],
+        "科技/数码": ["手机", "电脑", "芯片", "处理器", "显卡", "屏幕", "电池", "系统", "软件", "app"],
+        "知识/科普": ["原理", "本质", "为什么", "分析", "研究", "数据", "实验", "证明", "科学", "技术"],
+        "生活/日常": ["生活", "日常", "vlog", "美食", "旅行", "健身", "穿搭", "护肤", "宠物", "家居"],
+        "影视/动漫": ["电影", "电视剧", "动漫", "动画", "解说", "剧情", "角色", "导演", "演员", "配音"],
+        "音乐/舞蹈": ["音乐", "歌曲", "翻唱", "舞蹈", "演奏", "吉他", "钢琴", "rap", "唱歌", "mv"],
+        "财经/职场": ["股票", "基金", "投资", "理财", "职场", "工作", "面试", "简历", "薪资", "创业"],
+    }
+    
+    content_topics = []
+    all_text = " ".join(all_texts)
+    for topic, keywords in topic_keywords.items():
+        hits = sum(1 for kw in keywords if kw in all_text)
+        if hits >= 2:
+            content_topics.append({"topic": topic, "hits": hits})
+    content_topics = sorted(content_topics, key=lambda x: x["hits"], reverse=True)[:5]
+    summary["content_topics"] = content_topics
+    
+    # 5. 观众反馈总结
+    pos_count = 0
+    neg_count = 0
+    for c in comments[:100]:
+        sentiment = analyze_sentiment(c["content"])
+        if sentiment == "positive":
+            pos_count += 1
+        elif sentiment == "negative":
+            neg_count += 1
+    
+    total = pos_count + neg_count
+    if total > 0:
+        pos_ratio = pos_count / total * 100
+        if pos_ratio > 70:
+            summary["audience_feedback"] = f"观众反馈整体正面（正面占比{pos_ratio:.0f}%），评论区氛围积极"
+        elif pos_ratio > 50:
+            summary["audience_feedback"] = f"观众反馈偏正面（正面占比{pos_ratio:.0f}%），有一定讨论度"
+        elif pos_ratio > 30:
+            summary["audience_feedback"] = f"观众反馈存在争议（正面占比{pos_ratio:.0f}%），评论区讨论激烈"
+        else:
+            summary["audience_feedback"] = f"观众反馈偏负面（正面占比{pos_ratio:.0f}%），建议谨慎观看"
+    else:
+        summary["audience_feedback"] = "评论样本不足，无法判断观众反馈"
+    
+    # 6. 估算阅读时间（基于字幕字数）
+    if subtitle_data:
+        char_count = len(subtitle_data["full_text"])
+        summary["estimated_reading_time"] = max(1, int(char_count / 300))  # 按每分钟300字估算
+    else:
+        summary["estimated_reading_time"] = 0
+    
+    return summary
 
 
 # ============================================================
@@ -392,7 +685,7 @@ def analyze_danmaku(danmakus, duration):
 # HTML报告生成
 # ============================================================
 
-def generate_html_report(video_info, comment_analysis, danmaku_analysis, output_path):
+def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary, output_path):
     """生成HTML分析报告"""
     
     # 准备数据
@@ -404,6 +697,38 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, output_
     danmaku_time_dist = danmaku_analysis.get("time_dist", [])
     peak_points = danmaku_analysis.get("peak_points", [])
     top_danmaku = danmaku_analysis.get("top_danmaku", [])
+    
+    # 视频内容总结数据
+    summary_tags = summary.get("tags", [])
+    summary_key_points = summary.get("key_points", [])
+    summary_high_freq = summary.get("high_freq_words", [])
+    summary_topics = summary.get("content_topics", [])
+    summary_feedback = summary.get("audience_feedback", "")
+    summary_reading_time = summary.get("estimated_reading_time", 0)
+    summary_has_subtitle = summary.get("has_subtitle", False)
+    summary_subtitle_error = summary.get("subtitle_error", "")
+    
+    # 生成内容总结HTML
+    tags_html = "".join(f'<span class="tag-item">{t}</span>' for t in summary_tags) if summary_tags else '<span style="color:#999;">暂无标签</span>'
+    
+    key_points_html = ""
+    if summary_key_points:
+        for i, kp in enumerate(summary_key_points, 1):
+            key_points_html += f"""
+            <div class="keypoint-item">
+                <div class="keypoint-time">⏱️ {kp['time']}</div>
+                <div class="keypoint-content">{kp['content']}</div>
+            </div>
+            """
+    else:
+        key_points_html = '<p style="color:#999;text-align:center;padding:20px;">暂无关键时间点（该视频可能无AI字幕）</p>'
+    
+    topics_html = ""
+    if summary_topics:
+        for t in summary_topics:
+            topics_html += f'<span class="topic-badge">{t["topic"]} <small>({t["hits"]}次)</small></span>'
+    else:
+        topics_html = '<span style="color:#999;">无法识别主题</span>'
     
     # 格式化时长
     duration = video_info.get("duration", 0)
@@ -611,6 +936,77 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, output_
         .insight-box h4 {{ font-size: 15px; margin-bottom: 12px; color: #fb7299; }}
         .insight-box ul {{ padding-left: 20px; }}
         .insight-box li {{ margin-bottom: 8px; font-size: 14px; line-height: 1.6; }}
+        /* 视频内容总结样式 */
+        .summary-overview {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }}
+        .summary-card {{
+            background: #fff;
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        }}
+        .summary-card .icon {{ font-size: 28px; margin-bottom: 8px; }}
+        .summary-card .value {{ font-size: 24px; font-weight: 700; color: #fb7299; }}
+        .summary-card .label {{ font-size: 13px; color: #999; margin-top: 4px; }}
+        .tags-container {{ margin-bottom: 20px; }}
+        .tag-item {{
+            display: inline-block;
+            background: #fff0f5;
+            color: #fb7299;
+            padding: 4px 12px;
+            border-radius: 16px;
+            font-size: 13px;
+            margin: 4px;
+        }}
+        .topic-badge {{
+            display: inline-block;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            padding: 6px 14px;
+            border-radius: 20px;
+            font-size: 13px;
+            margin: 4px;
+        }}
+        .topic-badge small {{ opacity: 0.8; }}
+        .keypoint-item {{
+            display: flex;
+            gap: 16px;
+            padding: 14px 16px;
+            background: #fafafa;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border-left: 3px solid #fb7299;
+        }}
+        .keypoint-time {{
+            flex-shrink: 0;
+            color: #fb7299;
+            font-weight: 600;
+            font-size: 14px;
+            min-width: 70px;
+        }}
+        .keypoint-content {{ flex: 1; font-size: 14px; line-height: 1.6; color: #333; }}
+        .feedback-box {{
+            background: linear-gradient(135deg, #e6f7ff 0%, #f0f9ff 100%);
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+            border-left: 4px solid #1890ff;
+        }}
+        .feedback-box h4 {{ color: #1890ff; margin-bottom: 10px; }}
+        .subtitle-warning {{
+            background: #fffbe6;
+            border: 1px solid #ffe58f;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
+            color: #ad6800;
+            font-size: 13px;
+        }}
     </style>
 </head>
 <body>
@@ -651,7 +1047,8 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, output_
 
         <!-- 标签页 -->
         <div class="tabs">
-            <div class="tab active" data-tab="comment-word">💬 评论词频</div>
+            <div class="tab active" data-tab="summary">📝 视频内容总结</div>
+            <div class="tab" data-tab="comment-word">💬 评论词频</div>
             <div class="tab" data-tab="comment-hot">🔥 热门评论</div>
             <div class="tab" data-tab="comment-sentiment">😊 情感分析</div>
             <div class="tab" data-tab="danmaku-word">🎯 弹幕词频</div>
@@ -659,8 +1056,51 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, output_
             <div class="tab" data-tab="danmaku-top">📝 高频弹幕</div>
         </div>
 
+        <!-- 视频内容总结 -->
+        <div class="chart-container" id="panel-summary">
+            <h3>📝 视频内容智能总结</h3>
+            {f'<div class="subtitle-warning">⚠️ {summary_subtitle_error}</div>' if summary_subtitle_error else ''}
+            
+            <div class="summary-overview">
+                <div class="summary-card">
+                    <div class="icon">⏱️</div>
+                    <div class="value">{duration_str}</div>
+                    <div class="label">视频时长</div>
+                </div>
+                <div class="summary-card">
+                    <div class="icon">📖</div>
+                    <div class="value">{summary_reading_time if summary_reading_time > 0 else '-'}</div>
+                    <div class="label">预计阅读时间(分钟)</div>
+                </div>
+                <div class="summary-card">
+                    <div class="icon">🏷️</div>
+                    <div class="value">{len(summary_tags)}</div>
+                    <div class="label">视频标签</div>
+                </div>
+                <div class="summary-card">
+                    <div class="icon">🎯</div>
+                    <div class="value">{len(summary_key_points)}</div>
+                    <div class="label">关键时间点</div>
+                </div>
+            </div>
+
+            <h4 style="margin-bottom:12px;color:#333;">🏷️ 视频标签</h4>
+            <div class="tags-container">{tags_html}</div>
+
+            <h4 style="margin:20px 0 12px;color:#333;">📂 内容主题识别</h4>
+            <div style="margin-bottom:20px;">{topics_html}</div>
+
+            <h4 style="margin:20px 0 12px;color:#333;">⏰ 关键内容时间线（基于字幕智能提取）</h4>
+            {key_points_html}
+
+            <div class="feedback-box">
+                <h4>💬 观众反馈总结</h4>
+                <p style="font-size:14px;line-height:1.6;color:#333;">{summary_feedback}</p>
+            </div>
+        </div>
+
         <!-- 评论词频 -->
-        <div class="chart-container" id="panel-comment-word">
+        <div class="chart-container hidden" id="panel-comment-word">
             <h3>评论区关键词TOP30</h3>
             <div class="chart" id="chart-comment-word"></div>
         </div>
@@ -707,7 +1147,7 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, output_
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 tab.classList.add('active');
                 const name = tab.dataset.tab;
-                ['comment-word','comment-hot','comment-sentiment','danmaku-word','danmaku-time','danmaku-top'].forEach(n => {{
+                ['summary','comment-word','comment-hot','comment-sentiment','danmaku-word','danmaku-time','danmaku-top'].forEach(n => {{
                     document.getElementById('panel-' + n).classList.toggle('hidden', n !== name);
                 }});
                 setTimeout(() => window.dispatchEvent(new Event('resize')), 100);
@@ -832,7 +1272,26 @@ def main():
     parser.add_argument("--max-pages", type=int, default=50, help="最大爬取评论页数（默认50）")
     parser.add_argument("--output", "-o", default="", help="输出HTML文件路径")
     parser.add_argument("--no-danmaku", action="store_true", help="不爬取弹幕")
+    parser.add_argument("--cookie", default="", help="B站Cookie（从浏览器复制，必填）")
+    parser.add_argument("--cookie-file", default="", help="Cookie文件路径")
     args = parser.parse_args()
+
+    # 设置Cookie
+    cookie = args.cookie
+    if not cookie and args.cookie_file:
+        try:
+            with open(args.cookie_file, "r", encoding="utf-8") as f:
+                cookie = f.read().strip()
+        except Exception as e:
+            print(f"❌ 读取Cookie文件失败: {e}")
+            sys.exit(1)
+    if not cookie:
+        print("⚠️  未提供Cookie，可能无法访问B站API")
+        print("   获取方法：浏览器F12 → Network → 随便点个请求 → 复制Request Headers里的Cookie值")
+        print("   用法：python bilibili_comment_analyzer.py BV号 --cookie \"你的Cookie\"")
+    else:
+        set_cookie(cookie)
+        print("✅ Cookie已设置")
 
     bvid = extract_bvid(args.bvid)
     print(f"🎬 开始分析视频: {bvid}")
@@ -859,15 +1318,33 @@ def main():
         danmakus = get_danmaku(video_info["cid"])
         print(f"✅ 爬取到 {len(danmakus)} 条弹幕")
 
+    # 3.5 获取视频标签和字幕
+    print("\n🏷️ 获取视频标签...")
+    tags = get_video_tags(bvid)
+    print(f"✅ 获取到 {len(tags)} 个标签")
+
+    print("\n📝 获取视频AI字幕...")
+    subtitle_data, subtitle_error = get_video_subtitle(bvid, video_info["cid"])
+    if subtitle_data:
+        print(f"✅ 获取到 {subtitle_data['count']} 条字幕")
+    else:
+        print(f"⚠️  {subtitle_error}")
+
     # 4. 数据分析
     print("\n📊 正在分析数据...")
     comment_analysis = analyze_comments(comments)
     danmaku_analysis = analyze_danmaku(danmakus, video_info["duration"])
 
+    # 4.5 视频内容智能总结
+    print("\n🧠 正在智能总结视频内容...")
+    summary = summarize_video_content(video_info, subtitle_data, tags, comments, danmakus)
+    print(f"✅ 提取到 {len(summary['key_points'])} 个关键时间点")
+    print(f"✅ 识别到 {len(summary['content_topics'])} 个内容主题")
+
     # 5. 生成报告
     output_path = args.output or f"report_{bvid}.html"
     print(f"\n📝 生成HTML报告...")
-    generate_html_report(video_info, comment_analysis, danmaku_analysis, output_path)
+    generate_html_report(video_info, comment_analysis, danmaku_analysis, summary, output_path)
 
     print(f"\n🎉 分析完成！报告已保存至: {output_path}")
     print(f"   用浏览器打开即可查看交互式分析报告")
