@@ -1342,7 +1342,10 @@ def main():
     print(f"✅ 识别到 {len(summary['content_topics'])} 个内容主题")
 
     # 5. 生成报告
-    output_path = args.output or f"report_{bvid}.html"
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    task_dir = f"output/{date_str}_{bvid}"
+    os.makedirs(task_dir, exist_ok=True)
+    output_path = args.output or f"{task_dir}/report.html"
     print(f"\n📝 生成HTML报告...")
     generate_html_report(video_info, comment_analysis, danmaku_analysis, summary, output_path)
 
