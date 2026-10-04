@@ -39,6 +39,167 @@ HEADERS = {
 # 全局Cookie（运行时设置）
 BILIBILI_COOKIE = ""
 
+# DeepSeek API配置
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = "deepseek-chat"
+
+
+def markdown_to_html(text):
+    """简单的Markdown转HTML"""
+    if not text:
+        return ""
+    lines = text.split("\n")
+    html_lines = []
+    in_list = False
+    in_ol = False
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if in_list: html_lines.append("</ul>"); in_list = False
+            if in_ol: html_lines.append("</ol>"); in_ol = False
+            continue
+        if stripped.startswith("#### "):
+            if in_list: html_lines.append("</ul>"); in_list = False
+            if in_ol: html_lines.append("</ol>"); in_ol = False
+            html_lines.append(f"<h5>{stripped[5:]}</h5>"); continue
+        if stripped.startswith("### "):
+            if in_list: html_lines.append("</ul>"); in_list = False
+            if in_ol: html_lines.append("</ol>"); in_ol = False
+            html_lines.append(f"<h4>{stripped[4:]}</h4>"); continue
+        if stripped.startswith("## "):
+            if in_list: html_lines.append("</ul>"); in_list = False
+            if in_ol: html_lines.append("</ol>"); in_ol = False
+            html_lines.append(f"<h4>{stripped[3:]}</h4>"); continue
+        if stripped.startswith("# "):
+            if in_list: html_lines.append("</ul>"); in_list = False
+            if in_ol: html_lines.append("</ol>"); in_ol = False
+            html_lines.append(f"<h3>{stripped[2:]}</h3>"); continue
+        if stripped.startswith("- ") or stripped.startswith("* "):
+            if not in_list:
+                if in_ol: html_lines.append("</ol>"); in_ol = False
+                html_lines.append("<ul>"); in_list = True
+            content = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', stripped[2:])
+            html_lines.append(f"<li>{content}</li>"); continue
+        ol_match = re.match(r'^(\d+)\.\s+(.+)$', stripped)
+        if ol_match:
+            if not in_ol:
+                if in_list: html_lines.append("</ul>"); in_list = False
+                html_lines.append("<ol>"); in_ol = True
+            content = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', ol_match.group(2))
+            html_lines.append(f"<li>{content}</li>"); continue
+        if in_list: html_lines.append("</ul>"); in_list = False
+        if in_ol: html_lines.append("</ol>"); in_ol = False
+        content = re.sub(r'\*\*(.+?)\*\*', r'<strong>\1</strong>', stripped)
+        html_lines.append(f"<p>{content}</p>")
+    if in_list: html_lines.append("</ul>")
+    if in_ol: html_lines.append("</ol>")
+    return "\n".join(html_lines)
+
+
+def deepseek_summary(api_key, video_info, comments, danmakus, subtitle_data=None, tags=None):
+    """调用DeepSeek生成视频内容深度总结"""
+    if not api_key:
+        return None
+    print("\n🤖 调用DeepSeek生成视频深度总结...")
+
+    # 准备评论内容（取点赞最高的50条）
+    sorted_comments = sorted(comments, key=lambda x: x.get("like", 0), reverse=True)[:50]
+    comments_text = ""
+    for i, c in enumerate(sorted_comments, 1):
+        content = c.get("content", "")[:300]
+        comments_text += f"\n【评论{i}】{c.get('user','')}（{c.get('like',0)}赞）: {content}"
+
+    # 准备弹幕内容（取100条）
+    danmaku_text = ""
+    if danmakus:
+        for d in danmakus[:100]:
+            danmaku_text += d.get("content", "") + " "
+
+    # 准备字幕内容（取前3000字）
+    subtitle_text = ""
+    if subtitle_data and subtitle_data.get("body"):
+        for s in subtitle_data["body"][:200]:
+            subtitle_text += s.get("content", "") + " "
+            if len(subtitle_text) > 3000:
+                break
+
+    tags_text = ", ".join([t.get("tag_name", "") if isinstance(t, dict) else str(t) for t in tags]) if tags else "无"
+
+    prompt = f"""你是一个专业的视频内容分析专家。请根据以下信息，对这个B站视频进行深度总结和分析。
+
+【视频基本信息】
+标题：{video_info.get('title','')}
+UP主：{video_info.get('owner','')}
+播放量：{video_info.get('view',0)}
+评论数：{video_info.get('reply',0)}
+弹幕数：{video_info.get('danmaku',0)}
+标签：{tags_text}
+
+【视频字幕摘要】（前3000字）
+{subtitle_text[:3000] if subtitle_text else '无字幕'}
+
+【高赞评论TOP50】{comments_text}
+
+【弹幕关键词】
+{danmaku_text[:500] if danmaku_text else '无弹幕'}
+
+请按以下格式生成深度分析报告（用中文，分点清晰，重点突出）：
+
+## 一、视频核心内容总结
+用3-5句话概括这个视频讲了什么，核心观点是什么。
+
+## 二、视频内容结构分析
+- 视频的主要内容板块有哪些？
+- 时间线上的关键节点是什么？
+- 视频的叙事节奏如何？
+
+## 三、观众反馈分析
+- 评论区的主流观点是什么？
+- 观众最关心的问题/争议点是什么？
+- 高赞评论反映了观众怎样的情绪和态度？
+- 弹幕的整体氛围是怎样的？
+
+## 四、视频亮点与不足
+- 这个视频做得好的地方是什么？
+- 有哪些不足或可以改进的地方？
+- 与同类视频相比有什么特色？
+
+## 五、核心观点提炼
+从视频和评论中提炼出5-8条最有价值的观点或信息。
+
+## 六、观看建议
+- 这个视频适合谁看？
+- 观看时应该重点关注什么？
+- 有没有必要看完整视频，还是看总结就够了？
+
+要求：
+1. 基于提供的信息，不要编造
+2. 重点突出，不要空泛的套话
+3. 敢于指出视频的不足
+4. 总字数控制在1500-2500字
+5. 重要信息用加粗标注"""
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": DEEPSEEK_MODEL,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 4000
+        }
+        resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=data, timeout=180)
+        resp.raise_for_status()
+        result = resp.json()
+        summary = result["choices"][0]["message"]["content"]
+        print(f"✅ 深度总结生成完成（约{len(summary)}字）")
+        return summary
+    except Exception as e:
+        print(f"⚠️  DeepSeek API调用失败: {e}")
+        return None
+
 
 def set_cookie(cookie):
     """设置B站Cookie到请求头"""
@@ -114,9 +275,12 @@ def print_progress(current, total, prefix=""):
 
 def safe_get(url, params=None, retries=3, delay=1):
     """带重试的GET请求"""
+    headers = HEADERS.copy()
+    if BILIBILI_COOKIE:
+        headers["Cookie"] = BILIBILI_COOKIE
     for i in range(retries):
         try:
-            resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+            resp = requests.get(url, params=params, headers=headers, timeout=15)
             resp.raise_for_status()
             return resp
         except Exception as e:
@@ -234,25 +398,23 @@ def get_video_info(bvid):
 def get_comments(aid, max_pages=50):
     """爬取视频评论（主评论+楼中楼）"""
     all_comments = []
-    url = "https://api.bilibili.com/x/v2/reply/main"
+    url = "https://api.bilibili.com/x/v2/reply"
     
-    next_cursor = 0
-    page = 0
-    
-    while page < max_pages:
-        params = sign_params({
+    for page in range(1, max_pages + 1):
+        params = {
             "type": 1,
             "oid": aid,
-            "mode": 3,  # 3=按热度排序
-            "next": next_cursor,
+            "sort": 2,  # 2=按热度排序
+            "pn": page,
             "ps": 20,
-        })
+        }
         resp = safe_get(url, params=params)
         if not resp:
             break
         
         data = resp.json()
         if data.get("code") != 0:
+            print(f"   ⚠️  API错误: {data.get('message', '未知')}")
             break
         
         replies = data.get("data", {}).get("replies")
@@ -282,16 +444,13 @@ def get_comments(aid, max_pages=50):
                     })
             all_comments.append(comment)
         
-        # 下一页
-        cursor = data.get("data", {}).get("cursor", {})
-        next_cursor = cursor.get("next", 0)
-        is_end = cursor.get("is_end", False)
+        page_info = data.get("data", {}).get("page", {})
+        total = page_info.get("count", 0)
+        print_progress(page, max_pages, f"爬取评论中 (共约{total}条)")
         
-        page += 1
-        print_progress(page, max_pages, "爬取评论中")
-        
-        if is_end:
+        if page * 20 >= total:
             break
+        
         time.sleep(0.5)
     
     return all_comments
@@ -685,7 +844,7 @@ def analyze_danmaku(danmakus, duration):
 # HTML报告生成
 # ============================================================
 
-def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary, output_path):
+def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary, output_path, ai_summary=None):
     """生成HTML分析报告"""
     
     # 准备数据
@@ -697,6 +856,63 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary
     danmaku_time_dist = danmaku_analysis.get("time_dist", [])
     peak_points = danmaku_analysis.get("peak_points", [])
     top_danmaku = danmaku_analysis.get("top_danmaku", [])
+    
+    # 生成纯HTML条形图
+    def make_bar_chart(data, color_start, color_end):
+        if not data:
+            return "<p style='color:#999;padding:20px;'>暂无数据</p>"
+        max_val = max(v for _, v in data) if data else 1
+        if max_val == 0:
+            max_val = 1
+        html = '<div class="bar-chart">'
+        for label, value in data:
+            width = (value / max_val) * 100
+            html += f'''
+            <div class="bar-row">
+                <div class="bar-label" title="{label}">{label}</div>
+                <div class="bar-track">
+                    <div class="bar-fill" style="width:{width}%;background:linear-gradient(90deg,{color_start},{color_end});"></div>
+                </div>
+                <div class="bar-value">{value}</div>
+            </div>'''
+        html += '</div>'
+        return html
+
+    comment_word_html = make_bar_chart(comments_word_freq[:30], '#fb7299', '#ff9cb8')
+    danmaku_word_html = make_bar_chart(danmaku_word_freq[:30], '#00a1d6', '#4fc3f7')
+    
+    # 情感分布用进度条
+    total_sentiment = sum(sentiments.values()) if sentiments else 1
+    sentiment_html = '<div style="padding:20px;">'
+    sentiment_items = [('正面', sentiments.get('positive', 0), '#52c41a'), 
+                       ('中性', sentiments.get('neutral', 0), '#1890ff'), 
+                       ('负面', sentiments.get('negative', 0), '#ff4d4f')]
+    for name, count, color in sentiment_items:
+        pct = (count / total_sentiment) * 100 if total_sentiment > 0 else 0
+        sentiment_html += f'''
+        <div style="margin-bottom:20px;">
+            <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+                <span style="font-size:16px;font-weight:500;">{name}</span>
+                <span style="font-size:14px;color:#666;">{count}条 ({pct:.1f}%)</span>
+            </div>
+            <div style="height:32px;background:#f0f2f5;border-radius:6px;overflow:hidden;">
+                <div style="width:{pct}%;height:100%;background:{color};border-radius:6px;transition:width 0.3s;"></div>
+            </div>
+        </div>'''
+    sentiment_html += '</div>'
+    
+    # 弹幕时间分布用纵向柱状图
+    time_html = '<div class="bar-chart" style="display:flex;align-items:flex-end;gap:6px;height:400px;padding:20px 0;">'
+    max_time = max(p['count'] for p in peak_points) if peak_points else 1
+    for p in peak_points:
+        height = (p['count'] / max_time) * 350 if max_time > 0 else 0
+        time_html += f'''
+        <div style="flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;">
+            <span style="font-size:12px;font-weight:600;">{p['count']}</span>
+            <div style="width:100%;height:{height}px;background:linear-gradient(180deg,#00a1d6,#4fc3f7);border-radius:4px 4px 0 0;min-height:4px;"></div>
+            <span style="font-size:10px;color:#666;white-space:nowrap;transform:rotate(-30deg);">{p['time_str']}</span>
+        </div>'''
+    time_html += '</div>'
     
     # 视频内容总结数据
     summary_tags = summary.get("tags", [])
@@ -788,7 +1004,6 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>B站视频评论弹幕分析 - {video_info['title']}</title>
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -854,6 +1069,44 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary
             border-left: 3px solid #fb7299;
         }}
         .chart {{ width: 100%; height: 400px; }}
+        /* 纯HTML条形图样式 */
+        .bar-chart {{ width: 100%; }}
+        .bar-row {{
+            display: flex;
+            align-items: center;
+            margin-bottom: 8px;
+            gap: 12px;
+        }}
+        .bar-label {{
+            width: 140px;
+            flex-shrink: 0;
+            text-align: right;
+            font-size: 14px;
+            color: #333;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }}
+        .bar-track {{
+            flex: 1;
+            height: 28px;
+            background: #f0f2f5;
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }}
+        .bar-fill {{
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.3s ease;
+        }}
+        .bar-value {{
+            width: 60px;
+            flex-shrink: 0;
+            font-size: 14px;
+            font-weight: 600;
+            color: #333;
+        }}
         .hidden {{ display: none; }}
         .comment-item {{
             display: flex;
@@ -936,6 +1189,21 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary
         .insight-box h4 {{ font-size: 15px; margin-bottom: 12px; color: #fb7299; }}
         .insight-box ul {{ padding-left: 20px; }}
         .insight-box li {{ margin-bottom: 8px; font-size: 14px; line-height: 1.6; }}
+        /* AI深度总结样式 */
+        .ai-summary {{
+            background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%);
+            border-radius: 12px;
+            padding: 28px;
+            margin-bottom: 24px;
+            border-left: 4px solid #8b5cf6;
+        }}
+        .ai-summary h3 {{ font-size: 20px; margin-bottom: 16px; color: #6d28d9; display: flex; align-items: center; gap: 8px; }}
+        .ai-summary h4 {{ font-size: 17px; margin: 20px 0 12px 0; color: #7c3aed; border-bottom: 2px solid #ddd6fe; padding-bottom: 6px; }}
+        .ai-summary p {{ font-size: 15px; line-height: 1.9; color: #333; margin-bottom: 10px; }}
+        .ai-summary ul {{ padding-left: 24px; margin-bottom: 12px; }}
+        .ai-summary li {{ font-size: 15px; line-height: 1.9; color: #333; margin-bottom: 8px; }}
+        .ai-summary strong {{ color: #6d28d9; }}
+        .ai-badge {{ display: inline-block; background: linear-gradient(135deg, #8b5cf6, #ec4899); color: white; padding: 2px 10px; border-radius: 12px; font-size: 11px; font-weight: 500; }}
         /* 视频内容总结样式 */
         .summary-overview {{
             display: grid;
@@ -1046,6 +1314,14 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary
         </div>
 
         <!-- 标签页 -->
+        <!-- AI深度总结 -->
+        {f'''
+        <div class="ai-summary">
+            <h3>🤖 AI深度总结 <span class="ai-badge">DeepSeek生成</span></h3>
+            {markdown_to_html(ai_summary)}
+        </div>
+        ''' if ai_summary else ''}
+
         <div class="tabs">
             <div class="tab active" data-tab="summary">📝 视频内容总结</div>
             <div class="tab" data-tab="comment-word">💬 评论词频</div>
@@ -1102,7 +1378,7 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary
         <!-- 评论词频 -->
         <div class="chart-container hidden" id="panel-comment-word">
             <h3>评论区关键词TOP30</h3>
-            <div class="chart" id="chart-comment-word"></div>
+            {comment_word_html}
         </div>
 
         <!-- 热门评论 -->
@@ -1114,19 +1390,19 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary
         <!-- 情感分析 -->
         <div class="chart-container hidden" id="panel-comment-sentiment">
             <h3>评论情感分布</h3>
-            <div class="chart" id="chart-sentiment"></div>
+            {sentiment_html}
         </div>
 
         <!-- 弹幕词频 -->
         <div class="chart-container hidden" id="panel-danmaku-word">
             <h3>弹幕关键词TOP30</h3>
-            <div class="chart" id="chart-danmaku-word"></div>
+            {danmaku_word_html}
         </div>
 
         <!-- 弹幕时间分布 -->
         <div class="chart-container hidden" id="panel-danmaku-time">
             <h3>弹幕时间分布（视频进度）</h3>
-            <div class="chart" id="chart-danmaku-time"></div>
+            {time_html}
             <div style="margin-top:20px;">
                 <h4 style="margin-bottom:12px;color:#333;">🔥 弹幕高潮点（高能时刻）</h4>
                 {peak_html if peak_html else '<p style="color:#999;">暂无明显高潮点</p>'}
@@ -1150,108 +1426,7 @@ def generate_html_report(video_info, comment_analysis, danmaku_analysis, summary
                 ['summary','comment-word','comment-hot','comment-sentiment','danmaku-word','danmaku-time','danmaku-top'].forEach(n => {{
                     document.getElementById('panel-' + n).classList.toggle('hidden', n !== name);
                 }});
-                setTimeout(() => window.dispatchEvent(new Event('resize')), 100);
             }});
-        }});
-
-        // 评论词频图
-        const commentWords = {json.dumps([[w,c] for w,c in comments_word_freq], ensure_ascii=False)};
-        if (commentWords.length > 0) {{
-            const chart1 = echarts.init(document.getElementById('chart-comment-word'));
-            chart1.setOption({{
-                tooltip: {{ trigger: 'axis', formatter: '{{b}}: {{c}}次' }},
-                grid: {{ left: 100, right: 40, top: 20, bottom: 30 }},
-                xAxis: {{ type: 'value', name: '出现次数' }},
-                yAxis: {{ type: 'category', data: commentWords.map(w=>w[0]).reverse(), axisLabel: {{fontSize:11}} }},
-                series: [{{
-                    data: commentWords.map(w=>w[1]).reverse(),
-                    type: 'bar',
-                    itemStyle: {{
-                        color: new echarts.graphic.LinearGradient(0,0,1,0,[
-                            {{offset:0,color:'#fb7299'}},{{offset:1,color:'#ff9c6e'}}
-                        ]),
-                        borderRadius: [0,4,4,0]
-                    }}
-                }}],
-                dataZoom: [{{type:'slider',yAxisIndex:0,orient:'vertical',right:10,width:15}}]
-            }});
-        }}
-
-        // 情感分析图
-        const sentimentData = [
-            {{name:'正面', value:{sentiments.get('positive',0)}, itemStyle:{{color:'#52c41a'}}}},
-            {{name:'中性', value:{sentiments.get('neutral',0)}, itemStyle:{{color:'#1890ff'}}}},
-            {{name:'负面', value:{sentiments.get('negative',0)}, itemStyle:{{color:'#ff4d4f'}}}}
-        ];
-        const chart2 = echarts.init(document.getElementById('chart-sentiment'));
-        chart2.setOption({{
-            tooltip: {{ trigger: 'item', formatter: '{{b}}: {{c}}条 ({{d}}%)' }},
-            legend: {{ bottom: 10 }},
-            series: [{{
-                type: 'pie',
-                radius: ['40%','70%'],
-                center: ['50%','45%'],
-                itemStyle: {{ borderRadius: 8, borderColor: '#fff', borderWidth: 2 }},
-                label: {{ formatter: '{{b}}\\n{{d}}%' }},
-                data: sentimentData
-            }}]
-        }});
-
-        // 弹幕词频图
-        const danmakuWords = {json.dumps([[w,c] for w,c in danmaku_word_freq], ensure_ascii=False)};
-        if (danmakuWords.length > 0) {{
-            const chart3 = echarts.init(document.getElementById('chart-danmaku-word'));
-            chart3.setOption({{
-                tooltip: {{ trigger: 'axis', formatter: '{{b}}: {{c}}次' }},
-                grid: {{ left: 100, right: 40, top: 20, bottom: 30 }},
-                xAxis: {{ type: 'value', name: '出现次数' }},
-                yAxis: {{ type: 'category', data: danmakuWords.map(w=>w[0]).reverse(), axisLabel: {{fontSize:11}} }},
-                series: [{{
-                    data: danmakuWords.map(w=>w[1]).reverse(),
-                    type: 'bar',
-                    itemStyle: {{
-                        color: new echarts.graphic.LinearGradient(0,0,1,0,[
-                            {{offset:0,color:'#23ade5'}},{{offset:1,color:'#b37feb'}}
-                        ]),
-                        borderRadius: [0,4,4,0]
-                    }}
-                }}],
-                dataZoom: [{{type:'slider',yAxisIndex:0,orient:'vertical',right:10,width:15}}]
-            }});
-        }}
-
-        // 弹幕时间分布图
-        const danmakuTimeData = {json.dumps(danmaku_time_dist)};
-        const chart4 = echarts.init(document.getElementById('chart-danmaku-time'));
-        chart4.setOption({{
-            tooltip: {{ trigger: 'axis', formatter: function(params) {{
-                return '视频进度 ' + params[0].dataIndex + '%: ' + params[0].value + '条弹幕';
-            }}}},
-            grid: {{ left: 50, right: 30, top: 30, bottom: 50 }},
-            xAxis: {{
-                type: 'category',
-                data: danmakuTimeData.map((_,i)=>i+'%'),
-                axisLabel: {{ interval: 9, fontSize: 11 }}
-            }},
-            yAxis: {{ type: 'value', name: '弹幕数' }},
-            dataZoom: [{{type:'inside'}},{{type:'slider',height:20,bottom:10}}],
-            series: [{{
-                data: danmakuTimeData,
-                type: 'line',
-                smooth: true,
-                symbol: 'none',
-                itemStyle: {{ color: '#23ade5' }},
-                areaStyle: {{
-                    color: new echarts.graphic.LinearGradient(0,0,0,1,[
-                        {{offset:0,color:'rgba(35,173,229,0.4)'}},
-                        {{offset:1,color:'rgba(35,173,229,0.05)'}}
-                    ])
-                }}
-            }}]
-        }});
-
-        window.addEventListener('resize', () => {{
-            [chart1, chart2, chart3, chart4].forEach(c => c && c.resize());
         }});
     </script>
 </body>
@@ -1274,6 +1449,7 @@ def main():
     parser.add_argument("--no-danmaku", action="store_true", help="不爬取弹幕")
     parser.add_argument("--cookie", default="", help="B站Cookie（从浏览器复制，必填）")
     parser.add_argument("--cookie-file", default="", help="Cookie文件路径")
+    parser.add_argument("--deepseek-api-key", default="", help="DeepSeek API Key（用于AI深度总结）")
     args = parser.parse_args()
 
     # 设置Cookie
@@ -1341,13 +1517,18 @@ def main():
     print(f"✅ 提取到 {len(summary['key_points'])} 个关键时间点")
     print(f"✅ 识别到 {len(summary['content_topics'])} 个内容主题")
 
+    # 4.6 DeepSeek AI深度总结
+    ai_summary = None
+    if args.deepseek_api_key:
+        ai_summary = deepseek_summary(args.deepseek_api_key, video_info, comments, danmakus, subtitle_data, tags)
+
     # 5. 生成报告
     date_str = datetime.now().strftime("%Y-%m-%d")
     task_dir = f"output/{date_str}_{bvid}"
     os.makedirs(task_dir, exist_ok=True)
     output_path = args.output or f"{task_dir}/report.html"
     print(f"\n📝 生成HTML报告...")
-    generate_html_report(video_info, comment_analysis, danmaku_analysis, summary, output_path)
+    generate_html_report(video_info, comment_analysis, danmaku_analysis, summary, output_path, ai_summary=ai_summary)
 
     print(f"\n🎉 分析完成！报告已保存至: {output_path}")
     print(f"   用浏览器打开即可查看交互式分析报告")
